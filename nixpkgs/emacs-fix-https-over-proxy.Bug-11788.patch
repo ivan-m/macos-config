@@ -1,0 +1,185 @@
+From 172363d31b3ad5f45da44aa09652d0e0779ef5f2 Mon Sep 17 00:00:00 2001
+From: Tao Fang <fangtao0901@gmail.com>
+Date: Tue, 22 Mar 2016 22:39:51 +0800
+Subject: [PATCH] Fix url https over proxy implement. (Bug#11788)
+
+* lisp/url/url-http.el: Fix url https over proxy implement. (Bug#11788)
+
+* etc/NEWS: Mention this.
+---
+ etc/NEWS             |   3 ++
+ lisp/url/url-http.el | 105 ++++++++++++++++++++++++++++++++++++++++++++-------
+ 2 files changed, 94 insertions(+), 14 deletions(-)
+
+diff --git a/etc/NEWS b/etc/NEWS
+index 4414625..7d2cc92 100644
+--- a/etc/NEWS
++++ b/etc/NEWS
+@@ -1193,6 +1193,9 @@ plist will contain a :peer element that has the output of
+ programmatically delete all cookies, or cookies from a specific
+ domain.
+ 
+++++
++*** The URL package now support https over proxy.
++
+ ** Tramp
+ 
+ +++
+diff --git a/lisp/url/url-http.el b/lisp/url/url-http.el
+index 33f6d11..4f180ed 100644
+--- a/lisp/url/url-http.el
++++ b/lisp/url/url-http.el
+@@ -197,7 +197,14 @@ request.")
+ 	;; `url-open-stream' needs a buffer in which to do things
+ 	;; like authentication.  But we use another buffer afterwards.
+ 	(unwind-protect
+-	    (let ((proc (url-open-stream host buf host port gateway-method)))
++            (let ((proc (url-open-stream host buf
++                                         (if url-using-proxy
++                                             (url-host url-using-proxy)
++                                           host)
++                                         (if url-using-proxy
++                                             (url-port url-using-proxy)
++                                           port)
++                                         gateway-method)))
+ 	      ;; url-open-stream might return nil.
+ 	      (when (processp proc)
+ 		;; Drop the temp buffer link before killing the buffer.
+@@ -925,7 +932,13 @@ should be shown to the user."
+ 	       (erase-buffer)
+                (let ((url-request-method url-http-method)
+                      (url-request-extra-headers url-http-extra-headers)
+-                     (url-request-data url-http-data))
++                     (url-request-data url-http-data)
++                     (url-using-proxy (url-find-proxy-for-url
++                                       url-current-object
++                                       (url-host url-current-object))))
++                 (when url-using-proxy
++                   (setq url-using-proxy
++                         (url-generic-parse-url url-using-proxy)))
+                  (url-http url-current-object url-callback-function
+                            url-callback-arguments (current-buffer)))))
+ 	    ((url-http-parse-headers)
+@@ -1209,17 +1222,20 @@ The return value of this function is the retrieval buffer."
+ 	 (nsm-noninteractive (or url-request-noninteractive
+ 				 (and (boundp 'url-http-noninteractive)
+ 				      url-http-noninteractive)))
+-	 (connection (url-http-find-free-connection host port gateway-method))
++         (connection (url-http-find-free-connection (url-host url)
++                                                    (url-port url)
++                                                    gateway-method))
+          (mime-accept-string url-mime-accept-string)
+ 	 (buffer (or retry-buffer
+ 		     (generate-new-buffer
+-                      (format " *http %s:%d*" host port)))))
++                      (format " *http %s:%d*" (url-host url) (url-port url))))))
+     (if (not connection)
+ 	;; Failed to open the connection for some reason
+ 	(progn
+ 	  (kill-buffer buffer)
+ 	  (setq buffer nil)
+-	  (error "Could not create connection to %s:%d" host port))
++          (error "Could not create connection to %s:%d" (url-host url)
++                 (url-port url)))
+       (with-current-buffer buffer
+ 	(mm-disable-multibyte)
+ 	(setq url-current-object url
+@@ -1275,13 +1291,72 @@ The return value of this function is the retrieval buffer."
+            (set-process-sentinel connection 'url-http-async-sentinel))
+           (`failed
+            ;; Asynchronous connection failed
+-           (error "Could not create connection to %s:%d" host port))
++           (error "Could not create connection to %s:%d" (url-host url)
++                  (url-port url)))
+           (_
+-           (set-process-sentinel connection
+-                                 'url-http-end-of-document-sentinel)
+-           (process-send-string connection (url-http-create-request))))))
++           (if (and url-http-proxy (string= "https"
++                                            (url-type url-current-object)))
++               (url-https-proxy-connect connection)
++             (set-process-sentinel connection
++                                   'url-http-end-of-document-sentinel)
++             (process-send-string connection (url-http-create-request)))))))
+     buffer))
+ 
++(defun url-https-proxy-connect (connection)
++  (setq url-http-after-change-function 'url-https-proxy-after-change-function)
++  (process-send-string connection (format (concat "CONNECT %s:%d HTTP/1.1\r\n"
++                                                  "Host: %s\r\n"
++                                                  "\r\n")
++                                          (url-host url-current-object)
++                                          (or (url-port url-current-object)
++                                              url-https-default-port)
++                                          (url-host url-current-object))))
++
++(defun url-https-proxy-after-change-function (st nd length)
++  (let* ((process-buffer (current-buffer))
++         (proc (get-buffer-process process-buffer)))
++    (goto-char (point-min))
++    (when (re-search-forward "^\r?\n" nil t)
++      (backward-char 1)
++      ;; Saw the end of the headers
++      (setq url-http-end-of-headers (set-marker (make-marker) (point)))
++      (url-http-parse-response)
++      (cond
++       ((null url-http-response-status)
++        ;; We got back a headerless malformed response from the
++        ;; server.
++        (url-http-activate-callback)
++        (error "Malformed response from proxy, fail!"))
++       ((= url-http-response-status 200)
++        (if (gnutls-available-p)
++            (condition-case e
++                (let ((tls-connection (gnutls-negotiate
++                                       :process proc
++                                       :hostname (url-host url-current-object)
++                                       :verify-error nil)))
++                  ;; check certificate validity
++                  (setq tls-connection
++                        (nsm-verify-connection tls-connection
++                                               (url-host url-current-object)
++                                               (url-port url-current-object)))
++                  (with-current-buffer process-buffer (erase-buffer))
++                  (set-process-buffer tls-connection process-buffer)
++                  (setq url-http-after-change-function
++                        'url-http-wait-for-headers-change-function)
++                  (set-process-filter tls-connection 'url-http-generic-filter)
++                  (process-send-string tls-connection
++                                       (url-http-create-request)))
++              (gnutls-error
++               (url-http-activate-callback)
++               (error "gnutls-error: %s" e))
++              (error
++               (url-http-activate-callback)
++               (error "error: %s" e)))
++          (error "error: gnutls support needed!")))
++       (t
++        (url-http-activate-callback)
++        (message "error response: %d" url-http-response-status))))))
++
+ (defun url-http-async-sentinel (proc why)
+   ;; We are performing an asynchronous connection, and a status change
+   ;; has occurred.
+@@ -1293,11 +1368,13 @@ The return value of this function is the retrieval buffer."
+ 	(url-http-end-of-document-sentinel proc why))
+        ((string= (substring why 0 4) "open")
+ 	(setq url-http-connection-opened t)
+-	(condition-case error
+-	    (process-send-string proc (url-http-create-request))
+-	  (file-error
+-	   (setq url-http-connection-opened nil)
+-	   (message "HTTP error: %s" error))))
++        (if (and url-http-proxy (string= "https" (url-type url-current-object)))
++            (url-https-proxy-connect proc)
++          (condition-case error
++              (process-send-string proc (url-http-create-request))
++            (file-error
++             (setq url-http-connection-opened nil)
++             (message "HTTP error: %s" error)))))
+        (t
+ 	(setf (car url-callback-arguments)
+ 	      (nconc (list :error (list 'error 'connection-failed why
+-- 
+2.7.4
+
